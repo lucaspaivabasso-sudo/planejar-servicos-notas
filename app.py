@@ -39,6 +39,15 @@ def get_supabase():
 
 supabase = get_supabase()
 
+def get_supabase_admin():
+    """Cliente administrativo usado somente para criar usuários.
+    A SERVICE_ROLE_KEY deve ficar apenas nos Secrets do Streamlit.
+    """
+    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not key:
+        return None
+    return create_client(st.secrets["SUPABASE_URL"], key)
+
 def brl(v):
     try:
         return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -102,7 +111,10 @@ if not profile:
         logout()
     st.stop()
 
-is_admin = profile.get("role") == "admin"
+role = profile.get("role", "funcionario")
+is_admin = role == "admin"
+is_gerente = role == "gerente"
+is_gestao = role in ("admin", "gerente")
 nome_usuario = profile.get("nome") or st.session_state["user"]["email"]
 
 # -----------------------------
@@ -110,11 +122,11 @@ nome_usuario = profile.get("nome") or st.session_state["user"]["email"]
 # -----------------------------
 st.sidebar.title("🌱 Planejar")
 st.sidebar.write(f"**{nome_usuario}**")
-st.sidebar.caption("Administrador" if is_admin else "Equipe")
+st.sidebar.caption({"admin": "Administrador", "gerente": "Gerente"}.get(role, "Equipe"))
 
 menu_items = ["🏠 Início", "🛠️ Adicionar serviço", "🧾 Adicionar nota", "📋 Meus lançamentos"]
-if is_admin:
-    menu_items += ["📊 Painel administrativo", "✅ Conferir notas", "👥 Equipe"]
+if is_gestao:
+    menu_items += ["📊 Painel administrativo", "🛠️ Conferir serviços", "✅ Conferir notas", "👥 Equipe"]
 
 menu = st.sidebar.radio("Menu", menu_items)
 st.sidebar.divider()
@@ -309,7 +321,7 @@ elif menu == "📋 Meus lançamentos":
 # -----------------------------
 # Painel admin
 # -----------------------------
-elif menu == "📊 Painel administrativo" and is_admin:
+elif menu == "📊 Painel administrativo" and is_gestao:
     st.title("📊 Painel administrativo")
     st.caption("Visão geral dos gastos e serviços da Planejar, com filtros e relatório em PDF.")
     try:
@@ -503,9 +515,78 @@ elif menu == "📊 Painel administrativo" and is_admin:
         st.error(f"Erro ao montar painel: {e}")
 
 # -----------------------------
+# Conferir serviços
+# -----------------------------
+elif menu == "🛠️ Conferir serviços" and is_gestao:
+    st.title("🛠️ Conferir serviços")
+    st.caption("Confira, edite ou exclua serviços lançados pela equipe.")
+    try:
+        rs = supabase.table("servicos").select("*").order("created_at", desc=True).execute()
+        rp = supabase.table("profiles").select("id,nome").execute()
+        nomes = {x["id"]: x.get("nome", "") for x in (rp.data or [])}
+        servicos_lista = rs.data or []
+
+        if not servicos_lista:
+            st.info("Nenhum serviço cadastrado.")
+        else:
+            busca = st.text_input("🔎 Buscar por cliente, fazenda ou serviço")
+            if busca.strip():
+                termo = busca.strip().lower()
+                servicos_lista = [x for x in servicos_lista if termo in " ".join([
+                    str(x.get("cliente") or ""), str(x.get("fazenda") or ""),
+                    str(x.get("tipo_servico") or ""), nomes.get(x.get("usuario_id"), "")
+                ]).lower()]
+
+            for sv in servicos_lista:
+                resp = nomes.get(sv.get("usuario_id"), "Não identificado")
+                titulo = f"{sv.get('data_servico')} • {sv.get('cliente')} • {sv.get('tipo_servico')} • {brl(sv.get('valor'))}"
+                with st.expander(titulo):
+                    st.caption(f"Responsável: {resp}")
+                    with st.form(f"edit_servico_{sv['id']}"):
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            d = st.date_input("Data", value=pd.to_datetime(sv.get("data_servico")).date(), key=f"d_{sv['id']}")
+                            cli = st.text_input("Cliente / Produtor", value=sv.get("cliente") or "", key=f"cli_{sv['id']}")
+                            faz = st.text_input("Fazenda", value=sv.get("fazenda") or "", key=f"faz_{sv['id']}")
+                            tipos = ["Coleta de solo", "Agricultura de precisão", "Carbono / Sensoriamento de carbono", "Mapeamento", "Regulagem de máquina", "Visita técnica", "Laudo", "Outro"]
+                            atual_tipo = sv.get("tipo_servico") or "Outro"
+                            if atual_tipo not in tipos:
+                                tipos.append(atual_tipo)
+                            tp = st.selectbox("Tipo de serviço", tipos, index=tipos.index(atual_tipo), key=f"tp_{sv['id']}")
+                        with c2:
+                            ar = st.number_input("Área (ha)", min_value=0.0, value=float(sv.get("area_ha") or 0), step=0.01, key=f"ar_{sv['id']}")
+                            val = st.number_input("Valor (R$)", min_value=0.0, value=float(sv.get("valor") or 0), step=10.0, key=f"val_{sv['id']}")
+                            sts = ["Executado", "Em andamento", "Agendado"]
+                            atual_st = sv.get("status") or "Executado"
+                            if atual_st not in sts:
+                                sts.append(atual_st)
+                            stat = st.selectbox("Status", sts, index=sts.index(atual_st), key=f"sts_{sv['id']}")
+                            obs = st.text_area("Observação", value=sv.get("observacao") or "", key=f"obs_{sv['id']}")
+                        salvar_edicao = st.form_submit_button("💾 Salvar alterações", use_container_width=True)
+                    if salvar_edicao:
+                        if not cli.strip():
+                            st.error("Informe o cliente/produtor.")
+                        else:
+                            supabase.table("servicos").update({
+                                "data_servico": str(d), "cliente": cli.strip(), "fazenda": faz.strip() or None,
+                                "tipo_servico": tp, "area_ha": float(ar), "valor": float(val),
+                                "status": stat, "observacao": obs.strip() or None
+                            }).eq("id", sv["id"]).execute()
+                            st.success("Serviço atualizado.")
+                            st.rerun()
+
+                    confirmar = st.checkbox("Confirmar exclusão deste serviço", key=f"conf_del_sv_{sv['id']}")
+                    if st.button("🗑️ Excluir serviço", key=f"del_sv_{sv['id']}", disabled=not confirmar, use_container_width=True):
+                        supabase.table("servicos").delete().eq("id", sv["id"]).execute()
+                        st.success("Serviço excluído.")
+                        st.rerun()
+    except Exception as e:
+        st.error(f"Erro ao carregar serviços: {e}")
+
+# -----------------------------
 # Conferir notas
 # -----------------------------
-elif menu == "✅ Conferir notas" and is_admin:
+elif menu == "✅ Conferir notas" and is_gestao:
     st.title("✅ Conferir notas")
     try:
         r = supabase.table("notas").select("*").order("created_at", desc=True).execute()
@@ -552,23 +633,90 @@ elif menu == "✅ Conferir notas" and is_admin:
                             "conferido_em": datetime.utcnow().isoformat()
                         }).eq("id", n["id"]).execute()
                         st.rerun()
+                    st.divider()
+                    confirmar_nota = st.checkbox("Confirmar exclusão desta nota", key=f"conf_del_n_{n['id']}")
+                    if st.button("🗑️ Excluir nota", key=f"del_n_{n['id']}", disabled=not confirmar_nota, use_container_width=True):
+                        if n.get("arquivo_path"):
+                            try:
+                                supabase.storage.from_("notas").remove([n["arquivo_path"]])
+                            except Exception:
+                                pass
+                        supabase.table("notas").delete().eq("id", n["id"]).execute()
+                        st.success("Nota excluída.")
+                        st.rerun()
     except Exception as e:
         st.error(f"Erro ao carregar notas: {e}")
 
 # -----------------------------
-# Equipe (admin)
+# Equipe (gestão)
 # -----------------------------
-elif menu == "👥 Equipe" and is_admin:
+elif menu == "👥 Equipe" and is_gestao:
     st.title("👥 Equipe")
-    st.info(
-        "Nesta V1, os usuários são criados no painel do Supabase em "
-        "**Authentication → Users**. Depois, cadastre o mesmo ID na tabela **profiles** "
-        "com o nome e a função (`admin` ou `funcionario`)."
-    )
+
+    if is_admin:
+        st.subheader("➕ Cadastrar usuário")
+        st.caption("Crie o acesso do funcionário ou gerente diretamente pelo aplicativo.")
+        admin_client = get_supabase_admin()
+        if admin_client is None:
+            st.warning("Para liberar o cadastro direto, adicione SUPABASE_SERVICE_ROLE_KEY nos Secrets do Streamlit.")
+        else:
+            with st.form("novo_usuario", clear_on_submit=True):
+                nome_novo = st.text_input("Nome *")
+                email_novo = st.text_input("E-mail *")
+                senha_nova = st.text_input("Senha inicial *", type="password", help="Use pelo menos 6 caracteres.")
+                role_nova = st.selectbox("Função", ["funcionario", "gerente", "admin"], format_func=lambda x: {"funcionario":"Funcionário", "gerente":"Gerente", "admin":"Administrador"}[x])
+                criar = st.form_submit_button("👤 Criar usuário", use_container_width=True)
+
+            if criar:
+                if not nome_novo.strip() or not email_novo.strip() or len(senha_nova) < 6:
+                    st.error("Preencha nome, e-mail e uma senha com pelo menos 6 caracteres.")
+                else:
+                    novo_id = None
+                    try:
+                        resp = admin_client.auth.admin.create_user({
+                            "email": email_novo.strip(),
+                            "password": senha_nova,
+                            "email_confirm": True
+                        })
+                        novo_id = resp.user.id
+                        admin_client.table("profiles").insert({
+                            "id": novo_id, "nome": nome_novo.strip(), "role": role_nova, "ativo": True
+                        }).execute()
+                        st.success(f"Usuário {nome_novo.strip()} criado com sucesso.")
+                        st.rerun()
+                    except Exception as e:
+                        if novo_id:
+                            try:
+                                admin_client.auth.admin.delete_user(novo_id)
+                            except Exception:
+                                pass
+                        st.error(f"Não foi possível criar o usuário: {e}")
+
+    st.subheader("Usuários cadastrados")
     try:
         r = supabase.table("profiles").select("*").order("nome").execute()
-        df = pd.DataFrame(r.data or [])
-        if not df.empty:
-            st.dataframe(df, use_container_width=True, hide_index=True)
+        perfis_lista = r.data or []
+        if not perfis_lista:
+            st.info("Nenhum usuário cadastrado.")
+        else:
+            df = pd.DataFrame(perfis_lista)
+            cols = [c for c in ["nome", "role", "ativo", "created_at"] if c in df.columns]
+            st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+            if is_admin:
+                st.subheader("Alterar função / situação")
+                opcoes = {f"{x.get('nome')} — {x.get('role')}": x for x in perfis_lista}
+                escolhido = st.selectbox("Usuário", list(opcoes.keys()))
+                alvo = opcoes[escolhido]
+                roles = ["funcionario", "gerente", "admin"]
+                nova_role = st.selectbox("Nova função", roles, index=roles.index(alvo.get("role", "funcionario")), format_func=lambda x: {"funcionario":"Funcionário", "gerente":"Gerente", "admin":"Administrador"}[x])
+                novo_ativo = st.checkbox("Usuário ativo", value=bool(alvo.get("ativo", True)))
+                if st.button("💾 Salvar usuário", use_container_width=True):
+                    if alvo["id"] == st.session_state["user"]["id"] and (nova_role != "admin" or not novo_ativo):
+                        st.error("Você não pode retirar seu próprio acesso de administrador por esta tela.")
+                    else:
+                        supabase.table("profiles").update({"role": nova_role, "ativo": novo_ativo}).eq("id", alvo["id"]).execute()
+                        st.success("Usuário atualizado.")
+                        st.rerun()
     except Exception as e:
         st.error(f"Erro ao carregar equipe: {e}")
