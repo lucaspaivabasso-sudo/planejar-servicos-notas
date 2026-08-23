@@ -4,7 +4,11 @@ from supabase import create_client
 from datetime import date, datetime
 from decimal import Decimal
 import uuid
+import re
+from io import BytesIO
 import pandas as pd
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+import pytesseract
 from relatorios import gerar_pdf_gastos
 
 st.set_page_config(
@@ -53,6 +57,162 @@ def brl(v):
         return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except:
         return "R$ 0,00"
+
+
+def _valor_brasileiro_para_float(txt):
+    if not txt:
+        return 0.0
+    t = str(txt).strip().replace("R$", "").replace(" ", "")
+    if "," in t:
+        t = t.replace(".", "").replace(",", ".")
+    else:
+        # Se houver um único ponto e 2 casas depois, pode ser decimal.
+        partes = t.split(".")
+        if len(partes) > 2:
+            t = "".join(partes)
+    try:
+        return float(t)
+    except Exception:
+        return 0.0
+
+
+def _inferir_categoria_ocr(texto):
+    t = (texto or "").lower()
+    regras = [
+        ("Combustível", ["combust", "gasolina", "diesel", "etanol", "posto ", "litros", "litro"]),
+        ("Alimentação", ["restaurante", "lanchonete", "refeicao", "refeição", "alimento", "mercado", "supermercado"]),
+        ("Hospedagem", ["hotel", "pousada", "hospedagem", "diaria", "diária"]),
+        ("Pedágio", ["pedagio", "pedágio", "concessionaria", "concessionária"]),
+        ("Manutenção", ["manutencao", "manutenção", "oficina", "mecanica", "mecânica", "reparo"]),
+        ("Peças", ["pecas", "peças", "auto pecas", "autopeças", "rolamento", "filtro", "correia"]),
+        ("Material de escritório", ["papelaria", "escritorio", "escritório", "toner", "cartucho"]),
+        ("Carbono", ["carbono", "carbon credit"]),
+        ("Campo / Coleta", ["coleta", "amostragem", "campo"]),
+    ]
+    for categoria, palavras in regras:
+        if any(p in t for p in palavras):
+            return categoria
+    return "Outros"
+
+
+def _inferir_pagamento_ocr(texto):
+    t = (texto or "").lower()
+    if "pix" in t:
+        return "Pix"
+    if any(x in t for x in ["cartao", "cartão", "credito", "crédito", "debito", "débito"]):
+        return "Cartão"
+    if "dinheiro" in t:
+        return "Dinheiro"
+    if "boleto" in t:
+        return "Boleto"
+    if any(x in t for x in ["transferencia", "transferência", "ted", "doc banc"]):
+        return "Transferência"
+    return "Outro"
+
+
+def extrair_dados_nota_ocr(texto):
+    """Extrai sugestões do OCR. Tudo continua editável antes do envio."""
+    texto = texto or ""
+    linhas = [re.sub(r"\s+", " ", x).strip() for x in texto.splitlines() if x.strip()]
+
+    # CNPJ
+    m_cnpj = re.search(r"\b\d{2}[. ]?\d{3}[. ]?\d{3}[/ ]?\d{4}-?\d{2}\b", texto)
+    cnpj = m_cnpj.group(0) if m_cnpj else ""
+
+    # Data: primeira data plausível encontrada.
+    data_encontrada = None
+    for padrao in [r"\b(\d{2})[/-](\d{2})[/-](\d{4})\b", r"\b(\d{2})[/-](\d{2})[/-](\d{2})\b"]:
+        for m in re.finditer(padrao, texto):
+            try:
+                d, mes, ano = [int(x) for x in m.groups()]
+                if ano < 100:
+                    ano += 2000
+                candidata = date(ano, mes, d)
+                if 2000 <= candidata.year <= date.today().year + 2:
+                    data_encontrada = candidata
+                    break
+            except Exception:
+                pass
+        if data_encontrada:
+            break
+
+    # Número da nota: tenta linhas marcadas como NF/NFC-e/NFe/Nota.
+    numero_nota = ""
+    padroes_numero = [
+        r"(?:NF-?E|NFC-?E|NFE|NOTA\s+FISCAL|NOTA|N[º°O]?)\s*[:#.-]?\s*(\d{3,12})",
+        r"(?:NUMERO|NÚMERO)\s*[:#.-]?\s*(\d{3,12})",
+    ]
+    for padrao in padroes_numero:
+        m = re.search(padrao, texto, flags=re.I)
+        if m:
+            numero_nota = m.group(1)
+            break
+
+    # Valor total: prioriza linhas contendo TOTAL / A PAGAR / VALOR.
+    valores_prioritarios = []
+    valores_gerais = []
+    moeda = re.compile(r"(?:R\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+[.,]\d{2})")
+    for linha in linhas:
+        encontrados = [m.group(1) for m in moeda.finditer(linha)]
+        nums = [_valor_brasileiro_para_float(x) for x in encontrados]
+        nums = [x for x in nums if x > 0]
+        valores_gerais.extend(nums)
+        if any(chave in linha.lower() for chave in ["total", "a pagar", "valor pago", "valor da nota", "vl total"]):
+            valores_prioritarios.extend(nums)
+    valor = max(valores_prioritarios) if valores_prioritarios else (max(valores_gerais) if valores_gerais else 0.0)
+
+    # Fornecedor: procura no início uma linha com letras e que não pareça cabeçalho fiscal.
+    fornecedor = ""
+    ignorar = ["danfe", "documento auxiliar", "nota fiscal", "nf-e", "nfce", "nfc-e", "cnpj", "cpf", "emissao", "emissão", "cupom fiscal"]
+    for linha in linhas[:12]:
+        low = linha.lower()
+        if len(linha) < 4 or len(linha) > 90:
+            continue
+        if any(x in low for x in ignorar):
+            continue
+        if re.search(r"[A-Za-zÀ-ÿ]{3,}", linha) and not re.fullmatch(r"[\d .,/:-]+", linha):
+            fornecedor = linha
+            break
+
+    return {
+        "fornecedor": fornecedor,
+        "data": data_encontrada or date.today(),
+        "valor": float(valor or 0.0),
+        "cnpj": cnpj,
+        "numero_nota": numero_nota,
+        "categoria": _inferir_categoria_ocr(texto),
+        "forma_pagamento": _inferir_pagamento_ocr(texto),
+        "texto": texto.strip(),
+    }
+
+
+def ler_foto_nota_ocr(conteudo):
+    """OCR local/gratuito via Tesseract. Retorna texto + sugestões de campos."""
+    imagem = Image.open(BytesIO(conteudo))
+    # Corrige rotação do celular antes do OCR.
+    imagem = ImageOps.exif_transpose(imagem).convert("RGB")
+    cinza = ImageOps.grayscale(imagem)
+    cinza = ImageEnhance.Contrast(cinza).enhance(1.8)
+    cinza = cinza.filter(ImageFilter.SHARPEN)
+    try:
+        texto = pytesseract.image_to_string(cinza, lang="por", config="--psm 6")
+    except Exception:
+        # Fallback caso o pacote de idioma português não esteja disponível.
+        texto = pytesseract.image_to_string(cinza, config="--psm 6")
+    return extrair_dados_nota_ocr(texto)
+
+
+def registrar_historico_nota(nota_id, acao, detalhes=None):
+    """Registra alterações importantes da nota sem interromper o app se o log falhar."""
+    try:
+        supabase.table("notas_historico").insert({
+            "nota_id": nota_id,
+            "usuario_id": st.session_state["user"]["id"],
+            "acao": acao,
+            "detalhes": detalhes
+        }).execute()
+    except Exception:
+        pass
 
 def login(email, senha):
     try:
@@ -217,54 +377,104 @@ elif menu == "🛠️ Adicionar serviço":
 # -----------------------------
 elif menu == "🧾 Adicionar nota":
     st.title("🧾 Adicionar nota")
-    st.caption("Você pode enviar uma foto ou PDF do comprovante.")
+    st.caption("Tire a foto pelo celular ou envie uma foto/PDF. Em fotos, o app pode tentar preencher os dados automaticamente.")
+
+    modo_anexo = st.radio(
+        "Como deseja anexar?",
+        ["📷 Tirar foto agora", "📁 Enviar foto/PDF"],
+        horizontal=True,
+        key="modo_anexo_nota",
+    )
+
+    if modo_anexo == "📷 Tirar foto agora":
+        arquivo = st.camera_input("Fotografe a nota", key="camera_nota")
+    else:
+        arquivo = st.file_uploader(
+            "Foto/PDF da nota *",
+            type=["jpg", "jpeg", "png", "pdf"],
+            key="upload_nota",
+        )
+
+    eh_imagem = bool(arquivo) and (
+        (getattr(arquivo, "type", "") or "").startswith("image/")
+        or str(getattr(arquivo, "name", "")).lower().endswith((".jpg", ".jpeg", ".png"))
+    )
+
+    if arquivo and eh_imagem:
+        if st.button("✨ Ler dados da foto automaticamente", use_container_width=True):
+            try:
+                with st.spinner("Lendo a nota..."):
+                    st.session_state["nota_ocr_resultado"] = ler_foto_nota_ocr(arquivo.getvalue())
+                st.success("Leitura concluída. Confira os dados antes de enviar.")
+            except Exception as e:
+                st.session_state.pop("nota_ocr_resultado", None)
+                st.warning(f"Não consegui ler essa foto automaticamente. Você ainda pode preencher os campos manualmente. Detalhe: {e}")
+    elif arquivo and not eh_imagem:
+        st.info("A leitura automática está disponível para fotos. O PDF continua podendo ser anexado normalmente.")
+
+    ocr = st.session_state.get("nota_ocr_resultado") or {}
+
+    if ocr:
+        st.subheader("🔎 Dados encontrados na foto")
+        o1, o2, o3, o4 = st.columns(4)
+        o1.metric("Fornecedor", ocr.get("fornecedor") or "Não identificado")
+        o2.metric("Valor", brl(ocr.get("valor") or 0))
+        o3.metric("CNPJ", ocr.get("cnpj") or "Não identificado")
+        o4.metric("Nº da nota", ocr.get("numero_nota") or "Não identificado")
+        st.caption("Esses dados são apenas sugestões da leitura da imagem. Confira e corrija o que for necessário.")
+        if ocr.get("texto"):
+            with st.expander("📝 Ver texto reconhecido na foto"):
+                st.text(ocr["texto"][:6000])
+
+    categorias = [
+        "Combustível", "Manutenção", "Peças", "Alimentação", "Hospedagem",
+        "Pedágio", "Material de escritório", "Campo / Coleta", "Carbono", "Outros"
+    ]
+    formas = ["Pix", "Cartão", "Dinheiro", "Boleto", "Transferência", "Outro"]
+    cat_ocr = ocr.get("categoria") if ocr.get("categoria") in categorias else "Outros"
+    forma_ocr = ocr.get("forma_pagamento") if ocr.get("forma_pagamento") in formas else "Outro"
 
     with st.form("nota_form", clear_on_submit=True):
-        arquivo = st.file_uploader("Foto/PDF da nota *", type=["jpg", "jpeg", "png", "pdf"])
         c1, c2 = st.columns(2)
         with c1:
-            data_nota = st.date_input("Data da nota", value=date.today())
-            fornecedor = st.text_input("Fornecedor *")
-            valor_nota = st.number_input("Valor (R$) *", min_value=0.0, step=1.0)
-            categoria = st.selectbox("Categoria", [
-                "Combustível",
-                "Manutenção",
-                "Peças",
-                "Alimentação",
-                "Hospedagem",
-                "Pedágio",
-                "Material de escritório",
-                "Campo / Coleta",
-                "Carbono",
-                "Outros"
-            ])
+            data_nota = st.date_input("Data da nota", value=ocr.get("data") or date.today())
+            fornecedor = st.text_input("Fornecedor *", value=ocr.get("fornecedor") or "")
+            valor_nota = st.number_input(
+                "Valor (R$) *",
+                min_value=0.0,
+                step=1.0,
+                value=float(ocr.get("valor") or 0.0),
+            )
+            categoria = st.selectbox("Categoria", categorias, index=categorias.index(cat_ocr))
         with c2:
             cliente_nota = st.text_input("Cliente / Produtor relacionado")
             fazenda_nota = st.text_input("Fazenda relacionada")
-            forma_pagamento = st.selectbox("Forma de pagamento", [
-                "Pix", "Cartão", "Dinheiro", "Boleto", "Transferência", "Outro"
-            ])
+            forma_pagamento = st.selectbox("Forma de pagamento", formas, index=formas.index(forma_ocr))
             observacao_nota = st.text_area("Observação")
 
         enviar = st.form_submit_button("📤 Enviar nota", use_container_width=True)
 
     if enviar:
         if not arquivo:
-            st.error("Anexe a foto ou PDF da nota.")
+            st.error("Anexe ou tire uma foto da nota.")
         elif not fornecedor.strip():
             st.error("Informe o fornecedor.")
         elif valor_nota <= 0:
             st.error("Informe um valor maior que zero.")
         else:
             try:
-                ext = arquivo.name.split(".")[-1].lower()
+                nome_original = getattr(arquivo, "name", "") or f"foto_nota_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                if "." in nome_original:
+                    ext = nome_original.rsplit(".", 1)[-1].lower()
+                else:
+                    ext = "jpg" if eh_imagem else "bin"
                 uid = st.session_state["user"]["id"]
                 nome_arquivo = f"{uid}/{datetime.now().strftime('%Y/%m')}/{uuid.uuid4().hex}.{ext}"
                 conteudo = arquivo.getvalue()
                 supabase.storage.from_("notas").upload(
                     nome_arquivo,
                     conteudo,
-                    {"content-type": arquivo.type or "application/octet-stream", "upsert": "false"}
+                    {"content-type": getattr(arquivo, "type", None) or "application/octet-stream", "upsert": "false"}
                 )
 
                 payload = {
@@ -278,10 +488,11 @@ elif menu == "🧾 Adicionar nota":
                     "forma_pagamento": forma_pagamento,
                     "observacao": observacao_nota.strip() or None,
                     "arquivo_path": nome_arquivo,
-                    "arquivo_nome_original": arquivo.name,
+                    "arquivo_nome_original": nome_original,
                     "status": "Pendente"
                 }
                 supabase.table("notas").insert(payload).execute()
+                st.session_state.pop("nota_ocr_resultado", None)
                 st.success("Nota enviada. Ela ficou como **Pendente de conferência**.")
             except Exception as e:
                 st.error(f"Erro ao enviar a nota: {e}")
@@ -309,12 +520,144 @@ elif menu == "📋 Meus lançamentos":
     with tab2:
         try:
             r = supabase.table("notas").select("*").eq("usuario_id", uid).order("created_at", desc=True).execute()
-            df = pd.DataFrame(r.data or [])
-            if df.empty:
+            notas_usuario = r.data or []
+            if not notas_usuario:
                 st.info("Nenhuma nota lançada ainda.")
             else:
-                cols = [c for c in ["data_nota","fornecedor","valor","categoria","cliente","fazenda","status"] if c in df.columns]
-                st.dataframe(df[cols], use_container_width=True, hide_index=True)
+                st.caption("Notas **Pendentes** podem ser editadas. Depois de conferidas, ficam bloqueadas até o administrador liberar novamente.")
+
+                # Carrega o histórico em uma única consulta. Se a tabela ainda não existir, o app continua funcionando.
+                historico_por_nota = {}
+                try:
+                    rh = supabase.table("notas_historico").select("*").order("created_at", desc=True).execute()
+                    for h in (rh.data or []):
+                        historico_por_nota.setdefault(h.get("nota_id"), []).append(h)
+                except Exception:
+                    historico_por_nota = {}
+
+                categorias_nota = [
+                    "Combustível", "Manutenção", "Peças", "Alimentação", "Hospedagem",
+                    "Pedágio", "Material de escritório", "Campo / Coleta", "Carbono", "Outros"
+                ]
+                formas_pagamento = ["Pix", "Cartão", "Dinheiro", "Boleto", "Transferência", "Outro"]
+
+                for n in notas_usuario:
+                    status_nota = n.get("status") or "Pendente"
+                    icone_status = "🟡" if status_nota == "Pendente" else ("✅" if status_nota == "Conferida" else "❌")
+                    titulo = f"{icone_status} {n.get('data_nota')} • {n.get('fornecedor')} • {brl(n.get('valor'))} • {status_nota}"
+
+                    with st.expander(titulo):
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.write(f"**Categoria:** {n.get('categoria') or '-'}")
+                            st.write(f"**Cliente:** {n.get('cliente') or '-'}")
+                            st.write(f"**Fazenda:** {n.get('fazenda') or '-'}")
+                        with c2:
+                            st.write(f"**Pagamento:** {n.get('forma_pagamento') or '-'}")
+                            st.write(f"**Observação:** {n.get('observacao') or '-'}")
+                            if n.get("arquivo_path"):
+                                try:
+                                    signed = supabase.storage.from_("notas").create_signed_url(n["arquivo_path"], 120)
+                                    signed_url = signed.get("signedURL") or signed.get("signedUrl")
+                                    if signed_url:
+                                        st.link_button("📎 Abrir comprovante", signed_url, use_container_width=True)
+                                except Exception:
+                                    st.caption("Não foi possível gerar o link do comprovante.")
+
+                        if status_nota == "Pendente":
+                            st.divider()
+                            st.subheader("✏️ Editar nota")
+
+                            try:
+                                data_atual = datetime.strptime(str(n.get("data_nota")), "%Y-%m-%d").date()
+                            except Exception:
+                                data_atual = date.today()
+
+                            categoria_atual = n.get("categoria") or "Outros"
+                            if categoria_atual not in categorias_nota:
+                                categorias_nota_edicao = categorias_nota + [categoria_atual]
+                            else:
+                                categorias_nota_edicao = categorias_nota
+
+                            pagamento_atual = n.get("forma_pagamento") or "Outro"
+                            if pagamento_atual not in formas_pagamento:
+                                formas_pagamento_edicao = formas_pagamento + [pagamento_atual]
+                            else:
+                                formas_pagamento_edicao = formas_pagamento
+
+                            with st.form(f"editar_nota_{n['id']}"):
+                                e1, e2 = st.columns(2)
+                                with e1:
+                                    nova_data = st.date_input("Data da nota", value=data_atual, key=f"data_ed_{n['id']}")
+                                    novo_fornecedor = st.text_input("Fornecedor *", value=n.get("fornecedor") or "", key=f"forn_ed_{n['id']}")
+                                    novo_valor = st.number_input("Valor (R$) *", min_value=0.0, step=1.0, value=float(n.get("valor") or 0), key=f"valor_ed_{n['id']}")
+                                    nova_categoria = st.selectbox(
+                                        "Categoria", categorias_nota_edicao,
+                                        index=categorias_nota_edicao.index(categoria_atual),
+                                        key=f"cat_ed_{n['id']}"
+                                    )
+                                with e2:
+                                    novo_cliente = st.text_input("Cliente / Produtor relacionado", value=n.get("cliente") or "", key=f"cli_ed_{n['id']}")
+                                    nova_fazenda = st.text_input("Fazenda relacionada", value=n.get("fazenda") or "", key=f"faz_ed_{n['id']}")
+                                    nova_forma = st.selectbox(
+                                        "Forma de pagamento", formas_pagamento_edicao,
+                                        index=formas_pagamento_edicao.index(pagamento_atual),
+                                        key=f"pag_ed_{n['id']}"
+                                    )
+                                    nova_observacao = st.text_area("Observação", value=n.get("observacao") or "", key=f"obs_ed_{n['id']}")
+
+                                salvar_edicao = st.form_submit_button("💾 Salvar alterações", use_container_width=True)
+
+                            if salvar_edicao:
+                                if not novo_fornecedor.strip():
+                                    st.error("Informe o fornecedor.")
+                                elif novo_valor <= 0:
+                                    st.error("Informe um valor maior que zero.")
+                                else:
+                                    alteracoes = []
+                                    campos_comparacao = [
+                                        ("data", str(n.get("data_nota") or ""), str(nova_data)),
+                                        ("fornecedor", str(n.get("fornecedor") or ""), novo_fornecedor.strip()),
+                                        ("valor", float(n.get("valor") or 0), float(novo_valor)),
+                                        ("categoria", str(n.get("categoria") or ""), nova_categoria),
+                                        ("cliente", str(n.get("cliente") or ""), novo_cliente.strip()),
+                                        ("fazenda", str(n.get("fazenda") or ""), nova_fazenda.strip()),
+                                        ("pagamento", str(n.get("forma_pagamento") or ""), nova_forma),
+                                        ("observação", str(n.get("observacao") or ""), nova_observacao.strip()),
+                                    ]
+                                    for campo, antes, depois in campos_comparacao:
+                                        if antes != depois:
+                                            alteracoes.append(campo)
+
+                                    payload_edicao = {
+                                        "data_nota": str(nova_data),
+                                        "fornecedor": novo_fornecedor.strip(),
+                                        "valor": float(novo_valor),
+                                        "categoria": nova_categoria,
+                                        "cliente": novo_cliente.strip() or None,
+                                        "fazenda": nova_fazenda.strip() or None,
+                                        "forma_pagamento": nova_forma,
+                                        "observacao": nova_observacao.strip() or None,
+                                        # Mantém a nota pendente; usuário comum não consegue liberar nota já conferida.
+                                        "status": "Pendente"
+                                    }
+                                    supabase.table("notas").update(payload_edicao).eq("id", n["id"]).eq("usuario_id", uid).eq("status", "Pendente").execute()
+                                    detalhes = "Campos alterados: " + ", ".join(alteracoes) if alteracoes else "Salvo sem alteração de campos."
+                                    registrar_historico_nota(n["id"], "Nota editada", detalhes)
+                                    st.success("Alterações salvas. A nota continua pendente de conferência.")
+                                    st.rerun()
+                        else:
+                            st.info("🔒 Esta nota está bloqueada. Somente o administrador pode liberar novamente para edição.")
+
+                        historico = historico_por_nota.get(n.get("id"), [])
+                        if historico:
+                            st.divider()
+                            with st.expander("🕘 Histórico de alterações"):
+                                for h in historico[:20]:
+                                    quando = str(h.get("created_at") or "").replace("T", " ")[:19]
+                                    st.write(f"**{quando}** — {h.get('acao')}")
+                                    if h.get("detalhes"):
+                                        st.caption(h.get("detalhes"))
         except Exception as e:
             st.error(f"Erro ao carregar notas: {e}")
 
@@ -618,21 +961,44 @@ elif menu == "✅ Conferir notas" and is_gestao:
                             except Exception:
                                 st.caption("Não foi possível gerar o link do comprovante.")
 
-                    a, b = st.columns(2)
-                    if a.button("✅ Marcar como conferida", key=f"ok_{n['id']}", use_container_width=True):
-                        supabase.table("notas").update({
-                            "status": "Conferida",
-                            "conferido_por": st.session_state["user"]["id"],
-                            "conferido_em": datetime.utcnow().isoformat()
-                        }).eq("id", n["id"]).execute()
-                        st.rerun()
-                    if b.button("❌ Rejeitar", key=f"no_{n['id']}", use_container_width=True):
-                        supabase.table("notas").update({
-                            "status": "Rejeitada",
-                            "conferido_por": st.session_state["user"]["id"],
-                            "conferido_em": datetime.utcnow().isoformat()
-                        }).eq("id", n["id"]).execute()
-                        st.rerun()
+                    status_atual = n.get("status") or "Pendente"
+                    if status_atual == "Pendente":
+                        a, b = st.columns(2)
+                        if a.button("✅ Marcar como conferida", key=f"ok_{n['id']}", use_container_width=True):
+                            supabase.table("notas").update({
+                                "status": "Conferida",
+                                "conferido_por": st.session_state["user"]["id"],
+                                "conferido_em": datetime.utcnow().isoformat()
+                            }).eq("id", n["id"]).execute()
+                            registrar_historico_nota(n["id"], "Nota conferida", f"Conferida por {nome_usuario}.")
+                            st.rerun()
+                        if b.button("❌ Rejeitar", key=f"no_{n['id']}", use_container_width=True):
+                            supabase.table("notas").update({
+                                "status": "Rejeitada",
+                                "conferido_por": st.session_state["user"]["id"],
+                                "conferido_em": datetime.utcnow().isoformat()
+                            }).eq("id", n["id"]).execute()
+                            registrar_historico_nota(n["id"], "Nota rejeitada", f"Rejeitada por {nome_usuario}.")
+                            st.rerun()
+                    else:
+                        st.info("🔒 Nota bloqueada para edição.")
+                        if is_admin:
+                            if st.button("🔓 Liberar para edição", key=f"unlock_{n['id']}", use_container_width=True):
+                                supabase.table("notas").update({
+                                    "status": "Pendente",
+                                    "conferido_por": None,
+                                    "conferido_em": None
+                                }).eq("id", n["id"]).execute()
+                                registrar_historico_nota(
+                                    n["id"],
+                                    "Edição liberada",
+                                    f"Liberada pelo administrador {nome_usuario}. A nota voltou para Pendente."
+                                )
+                                st.success("Edição liberada. A nota voltou para Pendente.")
+                                st.rerun()
+                        else:
+                            st.caption("Apenas o administrador pode liberar esta nota novamente para edição.")
+
                     st.divider()
                     confirmar_nota = st.checkbox("Confirmar exclusão desta nota", key=f"conf_del_n_{n['id']}")
                     if st.button("🗑️ Excluir nota", key=f"del_n_{n['id']}", disabled=not confirmar_nota, use_container_width=True):
