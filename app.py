@@ -290,6 +290,33 @@ if is_gestao:
 
 menu = st.sidebar.radio("Menu", menu_items)
 st.sidebar.divider()
+with st.sidebar.expander("🔐 Alterar minha senha"):
+    nova_senha = st.text_input(
+        "Nova senha",
+        type="password",
+        key="nova_senha"
+    )
+    confirmar_senha = st.text_input(
+        "Confirmar nova senha",
+        type="password",
+        key="confirmar_nova_senha"
+    )
+
+    if st.button(
+        "💾 Salvar nova senha",
+        key="salvar_nova_senha",
+        use_container_width=True
+    ):
+        if len(nova_senha) < 6:
+            st.error("A nova senha precisa ter pelo menos 6 caracteres.")
+        elif nova_senha != confirmar_senha:
+            st.error("As duas senhas não são iguais.")
+        else:
+            try:
+                supabase.auth.update_user({"password": nova_senha})
+                st.success("✅ Senha alterada com sucesso.")
+            except Exception as e:
+                st.error(f"Erro ao alterar a senha: {e}")
 if st.sidebar.button("Sair", use_container_width=True):
     logout()
 
